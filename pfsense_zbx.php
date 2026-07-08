@@ -8,7 +8,7 @@ This program is licensed under Apache 2.0 License
 */
 
 //Some Useful defines
-define ('SCRIPT_VERSION','0.24.7-baitz.3');
+define ('SCRIPT_VERSION','0.24.7-baitz.4');
 
 define('SPEEDTEST_INTERVAL', 8); //Speedtest Interval (in hours)
 define('CRON_TIME_LIMIT', 300); // Time limit in seconds of speedtest and sysinfo 
@@ -19,7 +19,7 @@ define('DEFAULT_TIME_LIMIT', 30); // Time limit in seconds otherwise
  *
  * Modo frota (150+ pfSense): filtragem por IP/CIDR em PFZ_TRAFFIC_EXCLUDE_NETS.
  * NÃO depende de nome de regra, alias ou Description — mesmo script em todos.
- * Lê states do PF, acumula deltas em /tmp e devolve contador cumulativo.
+ * Lê states do PF (por hwif), acumula deltas em /tmp e devolve contador cumulativo.
  * Ver: pfsense_traffic_filtered_SETUP.md
  */
 define('PFZ_TRAFFIC_EXCLUDE_LABEL', 'zbx_excl'); // opcional; só se PFZ_TRAFFIC_USE_LABELS=true
@@ -29,12 +29,22 @@ define('PFZ_TRAFFIC_STATE_CACHE_TTL', 20); // segundos: evita pfctl repetido no 
 define('PFZ_TRAFFIC_STATE_FILE', '/tmp/pfz_traffic_excl_state.json');
 /*
  * Redes/hosts Baitz (gerência) — lista ÚNICA para todos os clientes.
- * Qualquer state com src ou dst nestes IPs/CIDRs entra em "excluded".
+ * Espelha aliases típicos: IP_NETWORK, Bacula_*, IP_NOC, IP_BAITZ_*, VPN SSL.
+ * Qualquer state com src ou dst nestes IPs/CIDRs entra em "excluded" da iface do state.
+ * NÃO usar 10.0.0.0/16 — WAN do cliente pode viver nesse /16 (só /24s de gerência).
  */
 define('PFZ_TRAFFIC_EXCLUDE_NETS',
+	/* Bacula_DS */
 	'10.3.0.127,' .
 	'10.0.0.230,' .
 	'10.0.0.232,' .
+	/* Bacula_Dir */
+	'10.3.0.126,' .
+	'10.3.0.247,' .
+	/* IP_BAITZ_GUACAMOLE / IP_DC_BACKUP (fora só dos /24 abaixo) */
+	'10.3.0.101,' .
+	'10.3.0.40,' .
+	/* IP_NETWORK (gerência Baitz) */
 	'10.0.0.0/24,' .
 	'10.0.2.0/24,' .
 	'10.0.3.0/24,' .
@@ -42,7 +52,10 @@ define('PFZ_TRAFFIC_EXCLUDE_NETS',
 	'10.0.5.0/24,' .
 	'172.16.0.0/16,' .
 	'172.17.0.0/16,' .
-	'172.18.0.0/16'
+	'172.18.0.0/16,' .
+	/* IPs_Baitz_VPN / Network_VPN_SSL */
+	'10.98.102.0/24,' .
+	'10.98.103.0/24'
 );
 
 require_once('globals.inc');
@@ -1722,29 +1735,60 @@ function pfz_traffic_extract_ipv4($endpoint) {
 }
 
 /*
- * Snapshot PF states que tocam CIDRs Baitz.
+ * Extrai hwif do primeiro token da linha de state PF.
+ * Retorna '' para "all" / sem iface (não atribuir a wan/lan).
+ */
+function pfz_traffic_parse_state_hwif($line) {
+	if (!preg_match('/^(\S+)\s+/', $line, $m)) {
+		return '';
+	}
+	$token = $m[1];
+	$proto = array('tcp', 'udp', 'icmp', 'esp', 'ah', 'gre', 'icmp6', 'ipv6-icmp', 'carp', 'pfsync');
+	if (in_array(strtolower($token), $proto, true)) {
+		return '';
+	}
+	if (strcasecmp($token, 'all') === 0) {
+		return '';
+	}
+	return $token;
+}
+
+/*
+ * Snapshot PF states que tocam CIDRs Baitz, agrupados por hwif.
  * dir: dst in exclude => out | src in exclude => in | ambos => out
+ * States sem iface ("all") são descartados para não contaminar wan/lan.
  */
 function pfz_traffic_cidr_snapshot() {
-	$states = array();
-	$snap_in = 0;
-	$snap_out = 0;
-	$matched = 0;
+	$states = array(); // states[hwif][id] = {bytes, dir, src, dst}
+	$snap_in = array();
+	$snap_out = array();
+	$matched = array();
+	$samples = array(); // até 5 IPs matched por hwif
 
 	exec('/sbin/pfctl -ss -vv 2>/dev/null', $lines);
 	if (!is_array($lines) || count($lines) === 0) {
-		return array('states' => $states, 'snap_in' => 0, 'snap_out' => 0, 'matched' => 0);
+		return array(
+			'states' => $states,
+			'snap_in' => $snap_in,
+			'snap_out' => $snap_out,
+			'matched' => $matched,
+			'samples' => $samples,
+		);
 	}
 
 	$cur_id = '';
 	$cur_src = '';
 	$cur_dst = '';
+	$cur_hwif = '';
 	$cur_bytes = 0;
 	$have_flow = false;
 
-	$flush = function () use (&$states, &$snap_in, &$snap_out, &$matched, &$cur_id, &$cur_src, &$cur_dst, &$cur_bytes, &$have_flow) {
-		if (!$have_flow || $cur_id === '') {
-			$cur_id = $cur_src = $cur_dst = '';
+	$flush = function () use (
+		&$states, &$snap_in, &$snap_out, &$matched, &$samples,
+		&$cur_id, &$cur_src, &$cur_dst, &$cur_hwif, &$cur_bytes, &$have_flow
+	) {
+		if (!$have_flow || $cur_id === '' || $cur_hwif === '') {
+			$cur_id = $cur_src = $cur_dst = $cur_hwif = '';
 			$cur_bytes = 0;
 			$have_flow = false;
 			return;
@@ -1752,24 +1796,43 @@ function pfz_traffic_cidr_snapshot() {
 		$src_ex = ($cur_src !== '' && pfz_traffic_ip_excluded($cur_src));
 		$dst_ex = ($cur_dst !== '' && pfz_traffic_ip_excluded($cur_dst));
 		if (!$src_ex && !$dst_ex) {
-			$cur_id = $cur_src = $cur_dst = '';
+			$cur_id = $cur_src = $cur_dst = $cur_hwif = '';
 			$cur_bytes = 0;
 			$have_flow = false;
 			return;
 		}
-		$matched++;
+		$hwif = $cur_hwif;
+		if (!isset($matched[$hwif])) {
+			$matched[$hwif] = 0;
+			$snap_in[$hwif] = 0;
+			$snap_out[$hwif] = 0;
+			$states[$hwif] = array();
+			$samples[$hwif] = array();
+		}
+		$matched[$hwif]++;
 		if ($dst_ex && !$src_ex) {
 			$dir = 'out';
-			$snap_out += $cur_bytes;
+			$snap_out[$hwif] += $cur_bytes;
 		} elseif ($src_ex && !$dst_ex) {
 			$dir = 'in';
-			$snap_in += $cur_bytes;
+			$snap_in[$hwif] += $cur_bytes;
 		} else {
 			$dir = 'out';
-			$snap_out += $cur_bytes;
+			$snap_out[$hwif] += $cur_bytes;
 		}
-		$states[$cur_id] = array('bytes' => $cur_bytes, 'dir' => $dir);
-		$cur_id = $cur_src = $cur_dst = '';
+		$states[$hwif][$cur_id] = array(
+			'bytes' => $cur_bytes,
+			'dir' => $dir,
+			'src' => $cur_src,
+			'dst' => $cur_dst,
+		);
+		if (count($samples[$hwif]) < 5) {
+			$hit = $dst_ex ? $cur_dst : $cur_src;
+			if ($hit !== '' && !in_array($hit, $samples[$hwif], true)) {
+				$samples[$hwif][] = $hit;
+			}
+		}
+		$cur_id = $cur_src = $cur_dst = $cur_hwif = '';
 		$cur_bytes = 0;
 		$have_flow = false;
 	};
@@ -1780,13 +1843,43 @@ function pfz_traffic_cidr_snapshot() {
 			continue;
 		}
 
-		if (preg_match('/^(?:[\w\.\-]+\s+)?(?:tcp|udp|icmp|esp|ah|gre|icmp6|ipv6-icmp|carp|pfsync)\s+(\S+)\s*(->|<-)\s*(\S+)/i', $trim, $fm)
-			|| preg_match('/^\S+\s+(?:tcp|udp|icmp|esp|ah|gre)\s+(\S+)\s*(->|<-)\s*(\S+)/i', $trim, $fm)
-		) {
+		// "vmx0 tcp A:port -> B:port …" | "all tcp A -> B …" | "tcp A -> B …"
+		if (preg_match(
+			'/^(?:([\w\.\-]+)\s+)?(tcp|udp|icmp|esp|ah|gre|icmp6|ipv6-icmp|carp|pfsync)\s+(\S+)\s*(->|<-)\s*(\S+)/i',
+			$trim,
+			$fm
+		)) {
 			$flush();
-			$a = pfz_traffic_extract_ipv4($fm[1]);
-			$b = pfz_traffic_extract_ipv4($fm[3]);
-			if ($fm[2] === '<-') {
+			$iface_token = isset($fm[1]) ? $fm[1] : '';
+			if ($iface_token === '' || strcasecmp($iface_token, 'all') === 0) {
+				$cur_hwif = '';
+				$have_flow = false;
+				continue;
+			}
+			$cur_hwif = $iface_token;
+			$a = pfz_traffic_extract_ipv4($fm[3]);
+			$b = pfz_traffic_extract_ipv4($fm[5]);
+			if ($fm[4] === '<-') {
+				$cur_src = $b;
+				$cur_dst = $a;
+			} else {
+				$cur_src = $a;
+				$cur_dst = $b;
+			}
+			$have_flow = ($cur_hwif !== '');
+			continue;
+		}
+
+		if (preg_match('/^(\S+)\s+(?:tcp|udp|icmp|esp|ah|gre)\s+(\S+)\s*(->|<-)\s*(\S+)/i', $trim, $fm)) {
+			$flush();
+			$cur_hwif = pfz_traffic_parse_state_hwif($trim);
+			if ($cur_hwif === '') {
+				$have_flow = false;
+				continue;
+			}
+			$a = pfz_traffic_extract_ipv4($fm[2]);
+			$b = pfz_traffic_extract_ipv4($fm[4]);
+			if ($fm[3] === '<-') {
 				$cur_src = $b;
 				$cur_dst = $a;
 			} else {
@@ -1799,9 +1892,9 @@ function pfz_traffic_cidr_snapshot() {
 
 		if (preg_match('/\b(?:tcp|udp|icmp)\s+from\s+(\S+)\s+to\s+(\S+)/i', $trim, $fm)) {
 			$flush();
-			$cur_src = pfz_traffic_extract_ipv4($fm[1]);
-			$cur_dst = pfz_traffic_extract_ipv4($fm[2]);
-			$have_flow = true;
+			// formato sem iface explícito — descartar
+			$cur_hwif = '';
+			$have_flow = false;
 			continue;
 		}
 
@@ -1823,23 +1916,26 @@ function pfz_traffic_cidr_snapshot() {
 		'snap_in' => $snap_in,
 		'snap_out' => $snap_out,
 		'matched' => $matched,
+		'samples' => $samples,
 	);
 }
 
 function pfz_traffic_load_state_file() {
 	$file = PFZ_TRAFFIC_STATE_FILE;
 	$empty = array(
-		'cumulative_in' => 0,
-		'cumulative_out' => 0,
-		'states' => array(),
+		'ifaces' => array(), // hwif => {cumulative_in, cumulative_out, states, matched}
 		'updated' => 0,
-		'matched' => 0,
+		'version' => 2,
 	);
 	if (!file_exists($file)) {
 		return $empty;
 	}
 	$data = json_decode(@file_get_contents($file), true);
 	if (!is_array($data)) {
+		return $empty;
+	}
+	// Migração v1 (global) -> v2 (por hwif): descarta acumulador antigo
+	if (!isset($data['ifaces']) || !is_array($data['ifaces'])) {
 		return $empty;
 	}
 	return array_merge($empty, $data);
@@ -1849,74 +1945,115 @@ function pfz_traffic_save_state_file($data) {
 	@file_put_contents(PFZ_TRAFFIC_STATE_FILE, json_encode($data));
 }
 
+function pfz_traffic_iface_bucket($store, $hwif) {
+	if ($hwif === '') {
+		return array(
+			'in' => 0,
+			'out' => 0,
+			'found' => false,
+			'matched' => 0,
+			'samples' => array(),
+			'mode' => 'cidr-states',
+		);
+	}
+	$ifaces = isset($store['ifaces']) && is_array($store['ifaces']) ? $store['ifaces'] : array();
+	if (!isset($ifaces[$hwif]) || !is_array($ifaces[$hwif])) {
+		return array(
+			'in' => 0,
+			'out' => 0,
+			'found' => false,
+			'matched' => 0,
+			'samples' => array(),
+			'mode' => 'cidr-states',
+		);
+	}
+	$b = $ifaces[$hwif];
+	$in = isset($b['cumulative_in']) ? (float)$b['cumulative_in'] : 0;
+	$out = isset($b['cumulative_out']) ? (float)$b['cumulative_out'] : 0;
+	$matched = isset($b['matched']) ? (int)$b['matched'] : 0;
+	$samples = isset($b['samples']) && is_array($b['samples']) ? $b['samples'] : array();
+	return array(
+		'in' => $in,
+		'out' => $out,
+		'found' => ($matched > 0) || ($in + $out > 0),
+		'matched' => $matched,
+		'samples' => $samples,
+		'mode' => 'cidr-states',
+	);
+}
+
 /*
- * Acumula deltas dos states CIDR-matched -> contador monotônico.
+ * Acumula deltas dos states CIDR-matched por hwif -> contador monotônico.
  * Zabbix: change_per_second (+ *8 para bps).
  * Sem alterar regras PF; lista unica em PFZ_TRAFFIC_EXCLUDE_NETS.
  */
-function pfz_traffic_excluded_bytes_from_cidr() {
+function pfz_traffic_excluded_bytes_from_cidr($hwif = '') {
 	$now = time();
 	$prev = pfz_traffic_load_state_file();
 
 	if (($now - (int)$prev['updated']) < (int)PFZ_TRAFFIC_STATE_CACHE_TTL
 		&& (int)$prev['updated'] > 0
 	) {
-		return array(
-			'in' => (float)$prev['cumulative_in'],
-			'out' => (float)$prev['cumulative_out'],
-			'found' => ((int)$prev['matched'] > 0) || ((float)$prev['cumulative_in'] + (float)$prev['cumulative_out'] > 0),
-			'matched' => (int)$prev['matched'],
-			'mode' => 'cidr-states',
-		);
+		return pfz_traffic_iface_bucket($prev, $hwif);
 	}
 
 	$snap = pfz_traffic_cidr_snapshot();
-	$prev_states = isset($prev['states']) && is_array($prev['states']) ? $prev['states'] : array();
-	$cum_in = (float)$prev['cumulative_in'];
-	$cum_out = (float)$prev['cumulative_out'];
-	$delta_in = 0;
-	$delta_out = 0;
+	$prev_ifaces = isset($prev['ifaces']) && is_array($prev['ifaces']) ? $prev['ifaces'] : array();
+	$new_ifaces = array();
 
-	foreach ($snap['states'] as $id => $st) {
-		$bytes = (float)$st['bytes'];
-		$dir = $st['dir'];
-		$prev_b = isset($prev_states[$id]['bytes']) ? (float)$prev_states[$id]['bytes'] : 0;
-		$d = $bytes - $prev_b;
-		if ($d < 0) {
-			$d = $bytes;
-		}
-		if ($d > 0) {
-			if ($dir === 'in') {
-				$delta_in += $d;
-			} else {
-				$delta_out += $d;
+	$all_hwifs = array_unique(array_merge(array_keys($prev_ifaces), array_keys($snap['states'])));
+	foreach ($all_hwifs as $h) {
+		$prev_b = isset($prev_ifaces[$h]) && is_array($prev_ifaces[$h]) ? $prev_ifaces[$h] : array();
+		$cum_in = isset($prev_b['cumulative_in']) ? (float)$prev_b['cumulative_in'] : 0;
+		$cum_out = isset($prev_b['cumulative_out']) ? (float)$prev_b['cumulative_out'] : 0;
+		$prev_states = isset($prev_b['states']) && is_array($prev_b['states']) ? $prev_b['states'] : array();
+		$cur_states = isset($snap['states'][$h]) && is_array($snap['states'][$h]) ? $snap['states'][$h] : array();
+		$delta_in = 0;
+		$delta_out = 0;
+
+		foreach ($cur_states as $id => $st) {
+			$bytes = (float)$st['bytes'];
+			$dir = $st['dir'];
+			$prev_bytes = isset($prev_states[$id]['bytes']) ? (float)$prev_states[$id]['bytes'] : 0;
+			$d = $bytes - $prev_bytes;
+			if ($d < 0) {
+				$d = $bytes;
+			}
+			if ($d > 0) {
+				if ($dir === 'in') {
+					$delta_in += $d;
+				} else {
+					$delta_out += $d;
+				}
 			}
 		}
+
+		$cum_in += $delta_in;
+		$cum_out += $delta_out;
+		$matched_h = isset($snap['matched'][$h]) ? (int)$snap['matched'][$h] : 0;
+		$samples_h = isset($snap['samples'][$h]) && is_array($snap['samples'][$h]) ? $snap['samples'][$h] : array();
+
+		$new_ifaces[$h] = array(
+			'cumulative_in' => $cum_in,
+			'cumulative_out' => $cum_out,
+			'states' => $cur_states,
+			'matched' => $matched_h,
+			'samples' => $samples_h,
+			'last_snap_in' => isset($snap['snap_in'][$h]) ? $snap['snap_in'][$h] : 0,
+			'last_snap_out' => isset($snap['snap_out'][$h]) ? $snap['snap_out'][$h] : 0,
+			'last_delta_in' => $delta_in,
+			'last_delta_out' => $delta_out,
+		);
 	}
 
-	$cum_in += $delta_in;
-	$cum_out += $delta_out;
-
 	$save = array(
-		'cumulative_in' => $cum_in,
-		'cumulative_out' => $cum_out,
-		'states' => $snap['states'],
+		'ifaces' => $new_ifaces,
 		'updated' => $now,
-		'matched' => $snap['matched'],
-		'last_snap_in' => $snap['snap_in'],
-		'last_snap_out' => $snap['snap_out'],
-		'last_delta_in' => $delta_in,
-		'last_delta_out' => $delta_out,
+		'version' => 2,
 	);
 	pfz_traffic_save_state_file($save);
 
-	return array(
-		'in' => $cum_in,
-		'out' => $cum_out,
-		'found' => ($snap['matched'] > 0) || ($cum_in + $cum_out > 0),
-		'matched' => $snap['matched'],
-		'mode' => 'cidr-states',
-	);
+	return pfz_traffic_iface_bucket($save, $hwif);
 }
 
 function pfz_traffic_label_matches($label) {
@@ -1959,9 +2096,11 @@ function pfz_traffic_bytes_from_labels() {
 	return array('in' => $in, 'out' => $out, 'found' => $found);
 }
 
-function pfz_traffic_backup_bytes() {
-	$cidr = pfz_traffic_excluded_bytes_from_cidr();
-	if (defined('PFZ_TRAFFIC_USE_LABELS') && PFZ_TRAFFIC_USE_LABELS) {
+function pfz_traffic_backup_bytes($hwif = '') {
+	$cidr = pfz_traffic_excluded_bytes_from_cidr($hwif);
+	// Labels PF são globais; não misturar no modo por-iface (pode contaminar WAN/LAN).
+	// Mantido só se USE_LABELS=true E hwif vazio (legacy).
+	if ($hwif === '' && defined('PFZ_TRAFFIC_USE_LABELS') && PFZ_TRAFFIC_USE_LABELS) {
 		$lab = pfz_traffic_bytes_from_labels();
 		if (!empty($lab['found'])) {
 			$cidr['in'] = max((float)$cidr['in'], (float)$lab['in']);
@@ -2002,7 +2141,8 @@ function pfz_traffic_filtered($ifname, $metric, $direction = 'in') {
 	}
 
 	$total = pfz_traffic_if_bytes($ifname);
-	$excl = pfz_traffic_backup_bytes();
+	$hwif = isset($total['hwif']) ? $total['hwif'] : pfz_traffic_resolve_hwif($ifname);
+	$excl = pfz_traffic_backup_bytes($hwif);
 
 	$total_v = pfz_traffic_pick_direction($total, $direction);
 	$excl_v = pfz_traffic_pick_direction($excl, $direction);
@@ -2030,7 +2170,7 @@ function pfz_traffic_filtered($ifname, $metric, $direction = 'in') {
 		case 'debug':
 			echo json_encode(array(
 				'if' => $ifname,
-				'hwif' => isset($total['hwif']) ? $total['hwif'] : '',
+				'hwif' => $hwif,
 				'direction' => $direction,
 				'mode' => isset($excl['mode']) ? $excl['mode'] : 'cidr-states',
 				'total_in' => $total['in'],
@@ -2039,8 +2179,10 @@ function pfz_traffic_filtered($ifname, $metric, $direction = 'in') {
 				'excluded_out' => $excl['out'],
 				'excluded_found' => !empty($excl['found']),
 				'matched_states' => isset($excl['matched']) ? $excl['matched'] : 0,
+				'matched_samples' => isset($excl['samples']) ? $excl['samples'] : array(),
 				'exclude_nets' => PFZ_TRAFFIC_EXCLUDE_NETS,
 				'state_file' => PFZ_TRAFFIC_STATE_FILE,
+				'script_version' => SCRIPT_VERSION,
 			));
 			return;
 		default:
