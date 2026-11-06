@@ -8,7 +8,7 @@ This program is licensed under Apache 2.0 License
 */
 
 //Some Useful defines
-define ('SCRIPT_VERSION','0.24.7-baitz.5');
+define ('SCRIPT_VERSION','0.24.7-baitz.6');
 
 define('SPEEDTEST_INTERVAL', 8); //Speedtest Interval (in hours)
 define('CRON_TIME_LIMIT', 300); // Time limit in seconds of speedtest and sysinfo 
@@ -31,7 +31,8 @@ define('PFZ_TRAFFIC_STATE_FILE', '/tmp/pfz_traffic_excl_state.json');
  * Redes/hosts Baitz (gerência) — lista ÚNICA para todos os clientes.
  * Espelha aliases típicos: IP_NETWORK, Bacula_*, IP_NOC, IP_BAITZ_*, VPN SSL.
  * Qualquer state com src ou dst nestes IPs/CIDRs entra em "excluded" da iface do state.
- * NÃO usar 10.0.0.0/16 — WAN do cliente pode viver nesse /16 (só /24s de gerência).
+ * NÃO usar faixas amplas que possam coincidir com WAN do cliente.
+ * 10.0.0.0/24 removido: na T-Line a própria WAN usa essa rede e contaminava a classificação.
  */
 define('PFZ_TRAFFIC_EXCLUDE_NETS',
 	/* Bacula_DS */
@@ -45,7 +46,7 @@ define('PFZ_TRAFFIC_EXCLUDE_NETS',
 	'10.3.0.101,' .
 	'10.3.0.40,' .
 	/* IP_NETWORK (gerência Baitz) */
-	'10.0.0.0/24,' .
+	/* 10.0.0.0/24 removido por colisão com WANs de clientes; usar IPs explícitos acima. */
 	'10.0.2.0/24,' .
 	'10.0.3.0/24,' .
 	'10.0.4.0/24,' .
