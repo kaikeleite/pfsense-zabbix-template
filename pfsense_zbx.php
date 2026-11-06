@@ -8,7 +8,7 @@ This program is licensed under Apache 2.0 License
 */
 
 //Some Useful defines
-define ('SCRIPT_VERSION','0.24.7-baitz.9');
+define ('SCRIPT_VERSION','0.24.7-baitz.10');
 
 define('SPEEDTEST_INTERVAL', 8); //Speedtest Interval (in hours)
 define('CRON_TIME_LIMIT', 300); // Time limit in seconds of speedtest and sysinfo 
@@ -1766,6 +1766,7 @@ function pfz_traffic_cidr_snapshot() {
 	$snap_out = array();
 	$matched = array();
 	$samples = array(); // até 5 IPs matched por hwif
+	$details = array(); // até 10 states matched por hwif para diagnóstico
 
 	exec('/sbin/pfctl -ss -vv 2>/dev/null', $lines);
 	if (!is_array($lines) || count($lines) === 0) {
@@ -1775,6 +1776,7 @@ function pfz_traffic_cidr_snapshot() {
 			'snap_out' => $snap_out,
 			'matched' => $matched,
 			'samples' => $samples,
+			'details' => $details,
 		);
 	}
 
@@ -1789,7 +1791,7 @@ function pfz_traffic_cidr_snapshot() {
 	$pending_origif = '';
 
 	$flush = function () use (
-		&$states, &$snap_in, &$snap_out, &$matched, &$samples,
+		&$states, &$snap_in, &$snap_out, &$matched, &$samples, &$details,
 		&$cur_id, &$cur_src, &$cur_dst, &$cur_hwif, &$cur_bytes_fwd, &$cur_bytes_rev, &$have_flow,
 		&$pending_id, &$pending_origif
 	) {
@@ -1816,6 +1818,7 @@ function pfz_traffic_cidr_snapshot() {
 			$snap_out[$hwif] = 0;
 			$states[$hwif] = array();
 			$samples[$hwif] = array();
+			$details[$hwif] = array();
 		}
 		$matched[$hwif]++;
 
@@ -1845,6 +1848,15 @@ function pfz_traffic_cidr_snapshot() {
 			'src' => $cur_src,
 			'dst' => $cur_dst,
 		);
+		if (count($details[$hwif]) < 10) {
+			$details[$hwif][] = array(
+				'id' => $cur_id,
+				'src' => $cur_src,
+				'dst' => $cur_dst,
+				'bytes_in' => $bytes_in,
+				'bytes_out' => $bytes_out,
+			);
+		}
 		if (count($samples[$hwif]) < 5) {
 			$hit = $dst_ex ? $cur_dst : $cur_src;
 			if ($hit !== '' && !in_array($hit, $samples[$hwif], true)) {
@@ -1973,6 +1985,7 @@ function pfz_traffic_cidr_snapshot() {
 		'snap_out' => $snap_out,
 		'matched' => $matched,
 		'samples' => $samples,
+		'details' => $details,
 	);
 }
 
@@ -2028,12 +2041,14 @@ function pfz_traffic_iface_bucket($store, $hwif) {
 	$out = isset($b['cumulative_out']) ? (float)$b['cumulative_out'] : 0;
 	$matched = isset($b['matched']) ? (int)$b['matched'] : 0;
 	$samples = isset($b['samples']) && is_array($b['samples']) ? $b['samples'] : array();
+	$details = isset($b['details']) && is_array($b['details']) ? $b['details'] : array();
 	return array(
 		'in' => $in,
 		'out' => $out,
 		'found' => ($matched > 0) || ($in + $out > 0),
 		'matched' => $matched,
 		'samples' => $samples,
+		'details' => $details,
 		'mode' => 'cidr-states',
 	);
 }
@@ -2097,6 +2112,7 @@ function pfz_traffic_excluded_bytes_from_cidr($hwif = '') {
 		$cum_out += $delta_out;
 		$matched_h = isset($snap['matched'][$h]) ? (int)$snap['matched'][$h] : 0;
 		$samples_h = isset($snap['samples'][$h]) && is_array($snap['samples'][$h]) ? $snap['samples'][$h] : array();
+		$details_h = isset($snap['details'][$h]) && is_array($snap['details'][$h]) ? $snap['details'][$h] : array();
 
 		$new_ifaces[$h] = array(
 			'cumulative_in' => $cum_in,
@@ -2104,6 +2120,7 @@ function pfz_traffic_excluded_bytes_from_cidr($hwif = '') {
 			'states' => $cur_states,
 			'matched' => $matched_h,
 			'samples' => $samples_h,
+			'details' => $details_h,
 			'last_snap_in' => isset($snap['snap_in'][$h]) ? $snap['snap_in'][$h] : 0,
 			'last_snap_out' => isset($snap['snap_out'][$h]) ? $snap['snap_out'][$h] : 0,
 			'last_delta_in' => $delta_in,
@@ -2245,6 +2262,7 @@ function pfz_traffic_filtered($ifname, $metric, $direction = 'in') {
 				'excluded_found' => !empty($excl['found']),
 				'matched_states' => isset($excl['matched']) ? $excl['matched'] : 0,
 				'matched_samples' => isset($excl['samples']) ? $excl['samples'] : array(),
+				'matched_details' => isset($excl['details']) ? $excl['details'] : array(),
 				'exclude_nets' => PFZ_TRAFFIC_EXCLUDE_NETS,
 				'state_file' => PFZ_TRAFFIC_STATE_FILE,
 				'script_version' => SCRIPT_VERSION,
