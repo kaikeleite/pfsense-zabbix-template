@@ -8,7 +8,7 @@ This program is licensed under Apache 2.0 License
 */
 
 //Some Useful defines
-define ('SCRIPT_VERSION','0.24.7-baitz.7');
+define ('SCRIPT_VERSION','0.24.7-baitz.8');
 
 define('SPEEDTEST_INTERVAL', 8); //Speedtest Interval (in hours)
 define('CRON_TIME_LIMIT', 300); // Time limit in seconds of speedtest and sysinfo 
@@ -2052,17 +2052,25 @@ function pfz_traffic_excluded_bytes_from_cidr($hwif = '') {
 		foreach ($cur_states as $id => $st) {
 			$bytes = (float)$st['bytes'];
 			$dir = $st['dir'];
-			$prev_bytes = isset($prev_states[$id]['bytes']) ? (float)$prev_states[$id]['bytes'] : 0;
-			$d = $bytes - $prev_bytes;
-			if ($d < 0) {
-				$d = $bytes;
+
+			// State novo: apenas cria baseline. Nunca contabilizar todo o histórico
+			// acumulado do state como se tivesse ocorrido neste intervalo.
+			if (!isset($prev_states[$id]) || !isset($prev_states[$id]['bytes'])) {
+				continue;
 			}
-			if ($d > 0) {
-				if ($dir === 'in') {
-					$delta_in += $d;
-				} else {
-					$delta_out += $d;
-				}
+
+			$prev_bytes = (float)$prev_states[$id]['bytes'];
+			$d = $bytes - $prev_bytes;
+
+			// Counter reset/recriação: rebasa e ignora este intervalo para evitar pico falso.
+			if ($d <= 0) {
+				continue;
+			}
+
+			if ($dir === 'in') {
+				$delta_in += $d;
+			} else {
+				$delta_out += $d;
 			}
 		}
 
