@@ -8,7 +8,7 @@ This program is licensed under Apache 2.0 License
 */
 
 //Some Useful defines
-define ('SCRIPT_VERSION','0.24.7-baitz.4');
+define ('SCRIPT_VERSION','0.24.7-baitz.5');
 
 define('SPEEDTEST_INTERVAL', 8); //Speedtest Interval (in hours)
 define('CRON_TIME_LIMIT', 300); // Time limit in seconds of speedtest and sysinfo 
@@ -1756,7 +1756,8 @@ function pfz_traffic_parse_state_hwif($line) {
 /*
  * Snapshot PF states que tocam CIDRs Baitz, agrupados por hwif.
  * dir: dst in exclude => out | src in exclude => in | ambos => out
- * States sem iface ("all") são descartados para não contaminar wan/lan.
+ * States com prefixo 'all' aguardam origif: <hwif> nas linhas de metadados do pfctl.
+ * Isso preserva atribuição por interface sem contaminar WAN/LAN.
  */
 function pfz_traffic_cidr_snapshot() {
 	$states = array(); // states[hwif][id] = {bytes, dir, src, dst}
@@ -1851,12 +1852,14 @@ function pfz_traffic_cidr_snapshot() {
 		)) {
 			$flush();
 			$iface_token = isset($fm[1]) ? $fm[1] : '';
+			// Em pfSense 2.7/2.8, muitos states aparecem como "all tcp ..." e a
+			// interface real vem depois como "origif: vmx0". Não descarte o flow:
+			// mantenha-o pendente até processar as linhas de metadados.
 			if ($iface_token === '' || strcasecmp($iface_token, 'all') === 0) {
 				$cur_hwif = '';
-				$have_flow = false;
-				continue;
+			} else {
+				$cur_hwif = $iface_token;
 			}
-			$cur_hwif = $iface_token;
 			$a = pfz_traffic_extract_ipv4($fm[3]);
 			$b = pfz_traffic_extract_ipv4($fm[5]);
 			if ($fm[4] === '<-') {
@@ -1866,7 +1869,7 @@ function pfz_traffic_cidr_snapshot() {
 				$cur_src = $a;
 				$cur_dst = $b;
 			}
-			$have_flow = ($cur_hwif !== '');
+			$have_flow = true;
 			continue;
 		}
 
@@ -1902,10 +1905,26 @@ function pfz_traffic_cidr_snapshot() {
 			continue;
 		}
 
-		if (preg_match('/\bid:\s*(\d+)/i', $trim, $im)) {
-			$cur_id = $im[1];
+		// pfctl -ss -vv: a interface original pode vir apenas na linha de metadata.
+		if (preg_match('/\borigif:\s*([\w.\-]+)/i', $trim, $om)) {
+			$origif = $om[1];
+			if ($origif !== '' && strcasecmp($origif, 'all') !== 0) {
+				$cur_hwif = $origif;
+			}
 		}
-		if (preg_match('/\bbytes[:\s]+(\d+)/i', $trim, $bm)) {
+
+		// IDs atuais são hexadecimais em pfSense/FreeBSD (ex.: ff87e07200000000).
+		if (preg_match('/\bid:\s*([0-9a-f]+)/i', $trim, $im)) {
+			$cur_id = strtolower($im[1]);
+		}
+
+		// Formatos observados:
+		//   1050897283:552185352 bytes
+		//   bytes 12345 / bytes: 12345
+		// Para o acumulador por state usamos o total bidirecional do state.
+		if (preg_match('/\b(\d+):(\d+)\s+bytes\b/i', $trim, $bm)) {
+			$cur_bytes = (float)$bm[1] + (float)$bm[2];
+		} elseif (preg_match('/\bbytes[:\s]+(\d+)/i', $trim, $bm)) {
 			$cur_bytes = (float)$bm[1];
 		}
 	}
