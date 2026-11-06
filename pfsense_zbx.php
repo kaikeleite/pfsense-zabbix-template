@@ -8,7 +8,7 @@ This program is licensed under Apache 2.0 License
 */
 
 //Some Useful defines
-define ('SCRIPT_VERSION','0.24.7-baitz.6');
+define ('SCRIPT_VERSION','0.24.7-baitz.7');
 
 define('SPEEDTEST_INTERVAL', 8); //Speedtest Interval (in hours)
 define('CRON_TIME_LIMIT', 300); // Time limit in seconds of speedtest and sysinfo 
@@ -1784,10 +1784,13 @@ function pfz_traffic_cidr_snapshot() {
 	$cur_hwif = '';
 	$cur_bytes = 0;
 	$have_flow = false;
+	$pending_id = '';
+	$pending_origif = '';
 
 	$flush = function () use (
 		&$states, &$snap_in, &$snap_out, &$matched, &$samples,
-		&$cur_id, &$cur_src, &$cur_dst, &$cur_hwif, &$cur_bytes, &$have_flow
+		&$cur_id, &$cur_src, &$cur_dst, &$cur_hwif, &$cur_bytes, &$have_flow,
+		&$pending_id, &$pending_origif
 	) {
 		if (!$have_flow || $cur_id === '' || $cur_hwif === '') {
 			$cur_id = $cur_src = $cur_dst = $cur_hwif = '';
@@ -1853,14 +1856,19 @@ function pfz_traffic_cidr_snapshot() {
 		)) {
 			$flush();
 			$iface_token = isset($fm[1]) ? $fm[1] : '';
-			// Em pfSense 2.7/2.8, muitos states aparecem como "all tcp ..." e a
-			// interface real vem depois como "origif: vmx0". Não descarte o flow:
-			// mantenha-o pendente até processar as linhas de metadados.
+			// pfSense 2.7/2.8 pode emitir metadata ANTES do flow:
+			//   id: ...
+			//   origif: vmx0
+			//   all tcp A -> B
+			// Preserve esses metadados pendentes ao iniciar o state.
+			$cur_id = $pending_id;
 			if ($iface_token === '' || strcasecmp($iface_token, 'all') === 0) {
-				$cur_hwif = '';
+				$cur_hwif = $pending_origif;
 			} else {
 				$cur_hwif = $iface_token;
 			}
+			$pending_id = '';
+			$pending_origif = '';
 			$a = pfz_traffic_extract_ipv4($fm[3]);
 			$b = pfz_traffic_extract_ipv4($fm[5]);
 			if ($fm[4] === '<-') {
@@ -1902,21 +1910,31 @@ function pfz_traffic_cidr_snapshot() {
 			continue;
 		}
 
-		if (!$have_flow) {
-			continue;
-		}
-
-		// pfctl -ss -vv: a interface original pode vir apenas na linha de metadata.
+		// Metadata do pfctl pode aparecer ANTES ou DEPOIS da linha do flow.
 		if (preg_match('/\borigif:\s*([\w.\-]+)/i', $trim, $om)) {
 			$origif = $om[1];
 			if ($origif !== '' && strcasecmp($origif, 'all') !== 0) {
-				$cur_hwif = $origif;
+				if ($have_flow) {
+					$cur_hwif = $origif;
+				} else {
+					$pending_origif = $origif;
+				}
 			}
 		}
 
 		// IDs atuais são hexadecimais em pfSense/FreeBSD (ex.: ff87e07200000000).
+		// Uma nova linha 'id:' inicia o próximo bloco de state. Se havia um flow
+		// em andamento, finalize-o ANTES de guardar o novo ID como pendente.
 		if (preg_match('/\bid:\s*([0-9a-f]+)/i', $trim, $im)) {
-			$cur_id = strtolower($im[1]);
+			$new_id = strtolower($im[1]);
+			if ($have_flow) {
+				$flush();
+			}
+			$pending_id = $new_id;
+		}
+
+		if (!$have_flow) {
+			continue;
 		}
 
 		// Formatos observados:
