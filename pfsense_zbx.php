@@ -8,7 +8,7 @@ This program is licensed under Apache 2.0 License
 */
 
 //Some Useful defines
-define ('SCRIPT_VERSION','0.24.7-baitz.8');
+define ('SCRIPT_VERSION','0.24.7-baitz.9');
 
 define('SPEEDTEST_INTERVAL', 8); //Speedtest Interval (in hours)
 define('CRON_TIME_LIMIT', 300); // Time limit in seconds of speedtest and sysinfo 
@@ -1782,19 +1782,21 @@ function pfz_traffic_cidr_snapshot() {
 	$cur_src = '';
 	$cur_dst = '';
 	$cur_hwif = '';
-	$cur_bytes = 0;
+	$cur_bytes_fwd = 0;
+	$cur_bytes_rev = 0;
 	$have_flow = false;
 	$pending_id = '';
 	$pending_origif = '';
 
 	$flush = function () use (
 		&$states, &$snap_in, &$snap_out, &$matched, &$samples,
-		&$cur_id, &$cur_src, &$cur_dst, &$cur_hwif, &$cur_bytes, &$have_flow,
+		&$cur_id, &$cur_src, &$cur_dst, &$cur_hwif, &$cur_bytes_fwd, &$cur_bytes_rev, &$have_flow,
 		&$pending_id, &$pending_origif
 	) {
 		if (!$have_flow || $cur_id === '' || $cur_hwif === '') {
 			$cur_id = $cur_src = $cur_dst = $cur_hwif = '';
-			$cur_bytes = 0;
+			$cur_bytes_fwd = 0;
+			$cur_bytes_rev = 0;
 			$have_flow = false;
 			return;
 		}
@@ -1802,7 +1804,8 @@ function pfz_traffic_cidr_snapshot() {
 		$dst_ex = ($cur_dst !== '' && pfz_traffic_ip_excluded($cur_dst));
 		if (!$src_ex && !$dst_ex) {
 			$cur_id = $cur_src = $cur_dst = $cur_hwif = '';
-			$cur_bytes = 0;
+			$cur_bytes_fwd = 0;
+			$cur_bytes_rev = 0;
 			$have_flow = false;
 			return;
 		}
@@ -1815,19 +1818,30 @@ function pfz_traffic_cidr_snapshot() {
 			$samples[$hwif] = array();
 		}
 		$matched[$hwif]++;
-		if ($dst_ex && !$src_ex) {
-			$dir = 'out';
-			$snap_out[$hwif] += $cur_bytes;
-		} elseif ($src_ex && !$dst_ex) {
-			$dir = 'in';
-			$snap_in[$hwif] += $cur_bytes;
+
+		// O pfctl renderiza "FWD:REV bytes". Mapear cada contador para a
+		// direção física da interface em vez de somar os dois sentidos.
+		$bytes_in = 0;
+		$bytes_out = 0;
+		if ($src_ex && !$dst_ex) {
+			// Excluído -> cliente: forward entra pela WAN; reverse sai pela WAN.
+			$bytes_in = $cur_bytes_fwd;
+			$bytes_out = $cur_bytes_rev;
+		} elseif ($dst_ex && !$src_ex) {
+			// Cliente -> excluído: forward sai pela WAN; reverse entra pela WAN.
+			$bytes_out = $cur_bytes_fwd;
+			$bytes_in = $cur_bytes_rev;
 		} else {
-			$dir = 'out';
-			$snap_out[$hwif] += $cur_bytes;
+			// Ambos excluídos: conservar os dois sentidos sem duplicá-los.
+			$bytes_in = $cur_bytes_fwd;
+			$bytes_out = $cur_bytes_rev;
 		}
+
+		$snap_in[$hwif] += $bytes_in;
+		$snap_out[$hwif] += $bytes_out;
 		$states[$hwif][$cur_id] = array(
-			'bytes' => $cur_bytes,
-			'dir' => $dir,
+			'bytes_in' => $bytes_in,
+			'bytes_out' => $bytes_out,
 			'src' => $cur_src,
 			'dst' => $cur_dst,
 		);
@@ -1838,7 +1852,8 @@ function pfz_traffic_cidr_snapshot() {
 			}
 		}
 		$cur_id = $cur_src = $cur_dst = $cur_hwif = '';
-		$cur_bytes = 0;
+		$cur_bytes_fwd = 0;
+		$cur_bytes_rev = 0;
 		$have_flow = false;
 	};
 
@@ -1942,9 +1957,12 @@ function pfz_traffic_cidr_snapshot() {
 		//   bytes 12345 / bytes: 12345
 		// Para o acumulador por state usamos o total bidirecional do state.
 		if (preg_match('/\b(\d+):(\d+)\s+bytes\b/i', $trim, $bm)) {
-			$cur_bytes = (float)$bm[1] + (float)$bm[2];
+			$cur_bytes_fwd = (float)$bm[1];
+			$cur_bytes_rev = (float)$bm[2];
 		} elseif (preg_match('/\bbytes[:\s]+(\d+)/i', $trim, $bm)) {
-			$cur_bytes = (float)$bm[1];
+			// Formato legado sem separação direcional: considerar forward apenas.
+			$cur_bytes_fwd = (float)$bm[1];
+			$cur_bytes_rev = 0;
 		}
 	}
 	$flush();
@@ -2050,27 +2068,28 @@ function pfz_traffic_excluded_bytes_from_cidr($hwif = '') {
 		$delta_out = 0;
 
 		foreach ($cur_states as $id => $st) {
-			$bytes = (float)$st['bytes'];
-			$dir = $st['dir'];
+			$bytes_in = isset($st['bytes_in']) ? (float)$st['bytes_in'] : 0;
+			$bytes_out = isset($st['bytes_out']) ? (float)$st['bytes_out'] : 0;
 
 			// State novo: apenas cria baseline. Nunca contabilizar todo o histórico
 			// acumulado do state como se tivesse ocorrido neste intervalo.
-			if (!isset($prev_states[$id]) || !isset($prev_states[$id]['bytes'])) {
+			if (!isset($prev_states[$id])
+				|| !isset($prev_states[$id]['bytes_in'])
+				|| !isset($prev_states[$id]['bytes_out'])) {
 				continue;
 			}
 
-			$prev_bytes = (float)$prev_states[$id]['bytes'];
-			$d = $bytes - $prev_bytes;
+			$prev_in = (float)$prev_states[$id]['bytes_in'];
+			$prev_out = (float)$prev_states[$id]['bytes_out'];
+			$d_in = $bytes_in - $prev_in;
+			$d_out = $bytes_out - $prev_out;
 
-			// Counter reset/recriação: rebasa e ignora este intervalo para evitar pico falso.
-			if ($d <= 0) {
-				continue;
+			// Counter reset/recriação: rebasa apenas a direção afetada.
+			if ($d_in > 0) {
+				$delta_in += $d_in;
 			}
-
-			if ($dir === 'in') {
-				$delta_in += $d;
-			} else {
-				$delta_out += $d;
+			if ($d_out > 0) {
+				$delta_out += $d_out;
 			}
 		}
 
