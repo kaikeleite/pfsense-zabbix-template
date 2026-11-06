@@ -3,7 +3,7 @@
 pfsense_zbx.php - pfSense Zabbix Interface
 Version 0.24.7 - 2024-04-27
 
-Written by Riccardo Bicelli <r.bicelli@gmail.com>
+Written by Kaike Leite <kaikealexsander@gmail.com>
 This program is licensed under Apache 2.0 License
 */
 
