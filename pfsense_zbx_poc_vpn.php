@@ -1,7 +1,7 @@
 <?php
 /**
  * pfsense_zbx_poc_vpn.php
- * Version: 0.24.7-baitz.11-poc-vpn.2
+ * Version: 0.24.7-baitz.11-poc-vpn.3
  *
  * POC somente leitura para observabilidade de peers VPN no pfSense.
  * Não altera rotas, gateways, serviços, IPsec, OpenVPN ou configuração.
@@ -13,7 +13,7 @@
  *   probe_openvpn_client <VPNID>
  */
 
-define('POC_VERSION', '0.24.7-baitz.11-poc-vpn.2');
+define('POC_VERSION', '0.24.7-baitz.11-poc-vpn.3');
 define('PING_COUNT', 4);
 define('PING_WAIT_MS', 1000);
 define('STATE_DIR', '/tmp');
@@ -88,7 +88,8 @@ function poc_ping($ip) {
         'rtt_avg_ms' => 0.0,
         'rtt_max_ms' => 0.0,
         'jitter_ms' => 0.0,
-        'error' => ''
+        'error' => '',
+        'latency_source' => 'peer_icmp'
     ];
 
     if (!filter_var($ip, FILTER_VALIDATE_IP)) {
@@ -116,6 +117,7 @@ function poc_ping($ip) {
 
     if ($result['reachable'] === 0 && $rc !== 0 && $result['error'] === '') {
         $result['error'] = 'icmp_unreachable_or_blocked';
+        $result['latency_source'] = 'peer_icmp_unavailable';
     }
 
     return $result;
@@ -250,6 +252,17 @@ function poc_openvpn_runtime($vpnid) {
             ['connect_time_unix', 'connected_since', 'start_time', 'time_unix'],
             null
         ));
+
+        if ($connected === null) {
+            $connect_text = poc_first_value($client, ['connect_time'], null);
+            if (is_string($connect_text) && trim($connect_text) !== '') {
+                $parsed = strtotime(trim($connect_text));
+                if ($parsed !== false) {
+                    $connected = (int)$parsed;
+                }
+            }
+        }
+
         $result['connected_since_epoch'] = $connected;
         if ($connected !== null && $connected > 0 && $connected <= time()) {
             $result['uptime_sec'] = time() - (int)$connected;
@@ -388,6 +401,36 @@ function poc_ipsec_runtime($ikeid) {
     return $result;
 }
 
+
+function poc_debug_ipsec_shape() {
+    $sas = ipsec_list_sa();
+    $summary = [];
+
+    if (!is_array($sas)) {
+        poc_json(['type' => gettype($sas), 'value' => $sas]);
+        return;
+    }
+
+    foreach ($sas as $key => $sa) {
+        $row = [
+            'top_key' => (string)$key,
+            'type' => gettype($sa),
+            'keys' => is_array($sa) ? array_keys($sa) : []
+        ];
+
+        if (is_array($sa)) {
+            foreach (['con-id','ikeid','name','remote-host','remote_host','local-host','local_host','version'] as $k) {
+                if (array_key_exists($k, $sa)) {
+                    $row[$k] = $sa[$k];
+                }
+            }
+        }
+        $summary[] = $row;
+    }
+
+    poc_json($summary);
+}
+
 function poc_debug_ipsec_runtime($ikeid='') {
     $sas = ipsec_list_sa();
     if ($ikeid === '') {
@@ -508,6 +551,10 @@ switch ($cmd) {
 
     case 'probe_openvpn_client':
         poc_probe_openvpn_client(isset($argv[2]) ? $argv[2] : '');
+        break;
+
+    case 'debug_ipsec_shape':
+        poc_debug_ipsec_shape();
         break;
 
     case 'debug_ipsec_runtime':
