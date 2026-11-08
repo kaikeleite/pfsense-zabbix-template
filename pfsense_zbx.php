@@ -8,7 +8,7 @@ This program is licensed under Apache 2.0 License
 */
 
 //Some Useful defines
-define ('SCRIPT_VERSION','0.24.7-baitz.10');
+define ('SCRIPT_VERSION','0.24.7-baitz.11');
 
 define('SPEEDTEST_INTERVAL', 8); //Speedtest Interval (in hours)
 define('CRON_TIME_LIMIT', 300); // Time limit in seconds of speedtest and sysinfo 
@@ -1827,15 +1827,12 @@ function pfz_traffic_cidr_snapshot() {
 		$bytes_in = 0;
 		$bytes_out = 0;
 		if ($src_ex && !$dst_ex) {
-			// Excluído -> cliente: forward entra pela WAN; reverse sai pela WAN.
 			$bytes_in = $cur_bytes_fwd;
 			$bytes_out = $cur_bytes_rev;
 		} elseif ($dst_ex && !$src_ex) {
-			// Cliente -> excluído: forward sai pela WAN; reverse entra pela WAN.
 			$bytes_out = $cur_bytes_fwd;
 			$bytes_in = $cur_bytes_rev;
 		} else {
-			// Ambos excluídos: conservar os dois sentidos sem duplicá-los.
 			$bytes_in = $cur_bytes_fwd;
 			$bytes_out = $cur_bytes_rev;
 		}
@@ -1850,11 +1847,8 @@ function pfz_traffic_cidr_snapshot() {
 		);
 		if (count($details[$hwif]) < 10) {
 			$details[$hwif][] = array(
-				'id' => $cur_id,
-				'src' => $cur_src,
-				'dst' => $cur_dst,
-				'bytes_in' => $bytes_in,
-				'bytes_out' => $bytes_out,
+				'id' => $cur_id, 'src' => $cur_src, 'dst' => $cur_dst,
+				'bytes_in' => $bytes_in, 'bytes_out' => $bytes_out,
 			);
 		}
 		if (count($samples[$hwif]) < 5) {
@@ -1972,7 +1966,6 @@ function pfz_traffic_cidr_snapshot() {
 			$cur_bytes_fwd = (float)$bm[1];
 			$cur_bytes_rev = (float)$bm[2];
 		} elseif (preg_match('/\bbytes[:\s]+(\d+)/i', $trim, $bm)) {
-			// Formato legado sem separação direcional: considerar forward apenas.
 			$cur_bytes_fwd = (float)$bm[1];
 			$cur_bytes_rev = 0;
 		}
@@ -2086,8 +2079,7 @@ function pfz_traffic_excluded_bytes_from_cidr($hwif = '') {
 			$bytes_in = isset($st['bytes_in']) ? (float)$st['bytes_in'] : 0;
 			$bytes_out = isset($st['bytes_out']) ? (float)$st['bytes_out'] : 0;
 
-			// State novo: apenas cria baseline. Nunca contabilizar todo o histórico
-			// acumulado do state como se tivesse ocorrido neste intervalo.
+			// State novo: apenas cria baseline. Nunca contabilizar todo o histórico.
 			if (!isset($prev_states[$id])
 				|| !isset($prev_states[$id]['bytes_in'])
 				|| !isset($prev_states[$id]['bytes_out'])) {
@@ -2098,14 +2090,8 @@ function pfz_traffic_excluded_bytes_from_cidr($hwif = '') {
 			$prev_out = (float)$prev_states[$id]['bytes_out'];
 			$d_in = $bytes_in - $prev_in;
 			$d_out = $bytes_out - $prev_out;
-
-			// Counter reset/recriação: rebasa apenas a direção afetada.
-			if ($d_in > 0) {
-				$delta_in += $d_in;
-			}
-			if ($d_out > 0) {
-				$delta_out += $d_out;
-			}
+			if ($d_in > 0) $delta_in += $d_in;
+			if ($d_out > 0) $delta_out += $d_out;
 		}
 
 		$cum_in += $delta_in;
@@ -2276,6 +2262,252 @@ function pfz_traffic_filtered($ifname, $metric, $direction = 'in') {
 	echo (string)(int)$value;
 }
 
+
+/*
+ * Baitz v11 - observabilidade VPN site-to-site (read-only)
+ *
+ * Funções validadas em pfSense 2.7/2.8 + Zabbix:
+ * - discovery de IPsec Phase 1 e OpenVPN clients;
+ * - peer atual/resolvido e mudança de peer;
+ * - ICMP RTT/perda/jitter (quando permitido pelo peer);
+ * - runtime/status/uptime/bytes de IPsec/OpenVPN.
+ *
+ * Não altera rota, gateway, serviço, túnel ou configuração do pfSense.
+ */
+
+define('PFZ_VPN_PEER_STATE_FILE', '/tmp/pfz_vpn_peer_state.json');
+
+function pfz_vpn_json($data) {
+    echo json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+}
+
+function pfz_vpn_pick($arr, $keys, $default = null) {
+    if (!is_array($arr)) return $default;
+    foreach ($keys as $k) {
+        if (array_key_exists($k, $arr) && $arr[$k] !== '' && $arr[$k] !== null) return $arr[$k];
+    }
+    return $default;
+}
+
+function pfz_vpn_age_to_epoch($value) {
+    if ($value === null || $value === '' || !is_numeric($value)) return null;
+    $v = (int)$value;
+    if ($v <= 0) return null;
+    // pfSense/strongSwan expõe established/install-time como idade em segundos.
+    return ($v < 1000000000) ? (time() - $v) : $v;
+}
+
+function pfz_vpn_resolve_ipv4($host) {
+    $host = trim((string)$host);
+    if ($host === '') return '';
+    if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) return $host;
+    $ip = @gethostbyname($host);
+    return ($ip && $ip !== $host && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) ? $ip : '';
+}
+
+function pfz_vpn_peer_change($scope, $id, $peer) {
+    $file = PFZ_VPN_PEER_STATE_FILE;
+    $state = array();
+    if (file_exists($file)) {
+        $tmp = json_decode(@file_get_contents($file), true);
+        if (is_array($tmp)) $state = $tmp;
+    }
+    $key = $scope . ':' . $id;
+    $now = time();
+    $changed = 0;
+    $last = $now;
+    if (isset($state[$key]) && is_array($state[$key])) {
+        $lastPeer = isset($state[$key]['peer']) ? (string)$state[$key]['peer'] : '';
+        $last = isset($state[$key]['last_change_epoch']) ? (int)$state[$key]['last_change_epoch'] : $now;
+        if ($lastPeer !== '' && $peer !== '' && $lastPeer !== $peer) {
+            $changed = 1;
+            $last = $now;
+        }
+    }
+    $state[$key] = array('peer' => $peer, 'last_change_epoch' => $last, 'updated' => $now);
+    @file_put_contents($file, json_encode($state));
+    return array($changed, $last);
+}
+
+function pfz_vpn_ping($ip) {
+    $ret = array(
+        'reachable' => 0, 'loss_pct' => 100,
+        'rtt_min_ms' => 0, 'rtt_avg_ms' => 0, 'rtt_max_ms' => 0, 'jitter_ms' => 0,
+        'error' => 'icmp_unreachable_or_blocked', 'latency_source' => 'peer_icmp_unavailable'
+    );
+    if ($ip === '') return $ret;
+    $cmd = '/sbin/ping -n -c 4 -W 1000 ' . escapeshellarg($ip) . ' 2>&1';
+    $out = array(); $code = 0;
+    @exec($cmd, $out, $code);
+    $txt = implode("\n", $out);
+    if (preg_match('/([0-9.]+)%\s*packet loss/i', $txt, $m)) $ret['loss_pct'] = (float)$m[1];
+    if (preg_match('/(?:round-trip|rtt).*?=\s*([0-9.]+)\/([0-9.]+)\/([0-9.]+)\/([0-9.]+)\s*ms/i', $txt, $m)) {
+        $ret['rtt_min_ms'] = (float)$m[1];
+        $ret['rtt_avg_ms'] = (float)$m[2];
+        $ret['rtt_max_ms'] = (float)$m[3];
+        $ret['jitter_ms'] = (float)$m[4];
+    }
+    if ($ret['loss_pct'] < 100) {
+        $ret['reachable'] = 1;
+        $ret['error'] = '';
+        $ret['latency_source'] = 'peer_icmp';
+    }
+    return $ret;
+}
+
+function pfz_vpn_ipsec_phase1_all() {
+    require_once('ipsec.inc');
+    global $config;
+    init_config_arr(array('ipsec', 'phase1'));
+    return (isset($config['ipsec']['phase1']) && is_array($config['ipsec']['phase1'])) ? $config['ipsec']['phase1'] : array();
+}
+
+function pfz_vpn_ipsec_find($ikeid) {
+    foreach (pfz_vpn_ipsec_phase1_all() as $p1) {
+        if ((string)pfz_vpn_pick($p1, array('ikeid'), '') === (string)$ikeid) return $p1;
+    }
+    return null;
+}
+
+function pfz_vpn_discovery_ipsec() {
+    $data = array();
+    foreach (pfz_vpn_ipsec_phase1_all() as $p1) {
+        $id = (string)pfz_vpn_pick($p1, array('ikeid'), '');
+        if ($id === '') continue;
+        $data[] = array(
+            '{#IKEID}' => $id,
+            '{#NAME}' => (string)pfz_vpn_pick($p1, array('descr'), 'IPsec ' . $id),
+            '{#REMOTE}' => (string)pfz_vpn_pick($p1, array('remote-gateway','remote_gateway'), '')
+        );
+    }
+    pfz_vpn_json(array('data' => $data));
+}
+
+function pfz_vpn_ipsec_runtime($ikeid) {
+    require_once('ipsec.inc');
+    $sas = ipsec_list_sa();
+    $ret = array('runtime_found'=>0,'status'=>null,'connected_since_epoch'=>null,'uptime_sec'=>null,'bytes_in'=>null,'bytes_out'=>null,'child_sa_count'=>0);
+    if (!is_array($sas)) return $ret;
+    foreach ($sas as $sa) {
+        if (!is_array($sa)) continue;
+        $conid = (string)pfz_vpn_pick($sa, array('con-id','con_id'), '');
+        $num = preg_replace('/^con/i', '', $conid);
+        // pfSense usual mapping: con<ID>. Accept exact numeric prefix too.
+        if ($num === '' || !preg_match('/^' . preg_quote((string)$ikeid, '/') . '(?:$|\D|0{5})/', $num)) continue;
+        $ret['runtime_found'] = 1;
+        $ret['status'] = (string)pfz_vpn_pick($sa, array('state','status'), '');
+        $epoch = pfz_vpn_age_to_epoch(pfz_vpn_pick($sa, array('established'), null));
+        $children = pfz_vpn_pick($sa, array('child-sas','child_sas'), array());
+        if (!is_array($children)) $children = array();
+        $ret['child_sa_count'] += count($children);
+        $bin = 0; $bout = 0; $haveBytes = false;
+        foreach ($children as $ch) {
+            if (!is_array($ch)) continue;
+            $childEpoch = pfz_vpn_age_to_epoch(pfz_vpn_pick($ch, array('install-time','install_time'), null));
+            if ($childEpoch !== null && ($epoch === null || $childEpoch < $epoch)) $epoch = $childEpoch;
+            $v = pfz_vpn_pick($ch, array('bytes-in','bytes_in','bytesin'), null);
+            if ($v !== null && is_numeric($v)) { $bin += (float)$v; $haveBytes = true; }
+            $v = pfz_vpn_pick($ch, array('bytes-out','bytes_out','bytesout'), null);
+            if ($v !== null && is_numeric($v)) { $bout += (float)$v; $haveBytes = true; }
+        }
+        $ret['connected_since_epoch'] = $epoch;
+        $ret['uptime_sec'] = ($epoch !== null) ? max(0, time() - $epoch) : null;
+        $ret['bytes_in'] = $haveBytes ? (int)$bin : null;
+        $ret['bytes_out'] = $haveBytes ? (int)$bout : null;
+        break;
+    }
+    return $ret;
+}
+
+function pfz_vpn_probe_ipsec($ikeid) {
+    $p1 = pfz_vpn_ipsec_find($ikeid);
+    if (!is_array($p1)) { pfz_vpn_json(array('version'=>SCRIPT_VERSION,'scope'=>'ipsec','id'=>(string)$ikeid,'error'=>'ikeid_not_found')); return; }
+    $name = (string)pfz_vpn_pick($p1, array('descr'), 'IPsec ' . $ikeid);
+    $remote = (string)pfz_vpn_pick($p1, array('remote-gateway','remote_gateway'), '');
+    $ip = pfz_vpn_resolve_ipv4($remote);
+    list($changed,$last) = pfz_vpn_peer_change('ipsec',$ikeid,$ip !== '' ? $ip : $remote);
+    $ping = pfz_vpn_ping($ip);
+    $runtime = pfz_vpn_ipsec_runtime($ikeid);
+    $out = array_merge(array(
+        'version'=>SCRIPT_VERSION,'scope'=>'ipsec','id'=>(string)$ikeid,'name'=>$name,
+        'remote_gateway'=>$remote,'resolved_ip'=>$ip,'peer_changed'=>$changed,'last_change_epoch'=>$last
+    ), $ping, $runtime, array('vpn_type'=>'ipsec','unit_name'=>$name));
+    pfz_vpn_json($out);
+}
+
+function pfz_vpn_openvpn_clients() {
+    require_once('openvpn.inc');
+    $c = openvpn_get_active_clients();
+    return is_array($c) ? $c : array();
+}
+
+function pfz_vpn_openvpn_find($vpnid) {
+    foreach (pfz_vpn_openvpn_clients() as $c) {
+        if ((string)pfz_vpn_pick($c, array('vpnid','id'), '') === (string)$vpnid) return $c;
+    }
+    return null;
+}
+
+function pfz_vpn_discovery_openvpn_client() {
+    $data = array();
+    foreach (pfz_vpn_openvpn_clients() as $c) {
+        $id = (string)pfz_vpn_pick($c, array('vpnid','id'), '');
+        if ($id === '') continue;
+        $name = trim((string)pfz_vpn_pick($c, array('name','descr'), 'OpenVPN ' . $id));
+        $remote = (string)pfz_vpn_pick($c, array('remote_host','remote-host','remote','server_addr','serveraddr'), '');
+        if (preg_match('/^([^:]+):\d+$/', $remote, $m)) $remote = $m[1];
+        $data[] = array('{#VPNID}'=>$id,'{#NAME}'=>$name,'{#REMOTE}'=>$remote);
+    }
+    pfz_vpn_json(array('data'=>$data));
+}
+
+function pfz_vpn_probe_openvpn_client($vpnid) {
+    $c = pfz_vpn_openvpn_find($vpnid);
+    if (!is_array($c)) { pfz_vpn_json(array('version'=>SCRIPT_VERSION,'scope'=>'openvpn_client','id'=>(string)$vpnid,'error'=>'vpnid_not_found')); return; }
+    $name = trim((string)pfz_vpn_pick($c, array('name','descr'), 'OpenVPN ' . $vpnid));
+    $remote = (string)pfz_vpn_pick($c, array('remote_host','remote-host','remote','server_addr','serveraddr'), '');
+    if (preg_match('/^([^:]+):\d+$/', $remote, $m)) $remote = $m[1];
+    $ip = pfz_vpn_resolve_ipv4($remote);
+    list($changed,$last) = pfz_vpn_peer_change('openvpn_client',$vpnid,$ip !== '' ? $ip : $remote);
+    $ping = pfz_vpn_ping($ip);
+    $status = (string)pfz_vpn_pick($c, array('status','state'), '');
+    $epoch = pfz_vpn_age_to_epoch(pfz_vpn_pick($c, array('connect_time','connected_since','connected-since','uptime'), null));
+    // Alguns retornos trazem connect_time como epoch; outros uptime como idade.
+    $uptime = ($epoch !== null) ? max(0, time() - $epoch) : null;
+    $bin = pfz_vpn_pick($c, array('bytes_recv','bytes-recv','bytes_in','bytes-in','bytesin'), null);
+    $bout = pfz_vpn_pick($c, array('bytes_sent','bytes-sent','bytes_out','bytes-out','bytesout'), null);
+    $virtual = (string)pfz_vpn_pick($c, array('virtual_addr','virtual-address','virtual_ip','virtualip'), '');
+    $runtimeRemote = (string)pfz_vpn_pick($c, array('remote_host','remote-host','remote'), $remote);
+    $out = array_merge(array(
+        'version'=>SCRIPT_VERSION,'scope'=>'openvpn_client','id'=>(string)$vpnid,'name'=>$name,
+        'remote_gateway'=>$remote,'resolved_ip'=>$ip,'peer_changed'=>$changed,'last_change_epoch'=>$last
+    ), $ping, array(
+        'runtime_found'=>1,'status'=>$status,'connected_since_epoch'=>$epoch,'uptime_sec'=>$uptime,
+        'bytes_in'=>is_numeric($bin)?(int)$bin:null,'bytes_out'=>is_numeric($bout)?(int)$bout:null,
+        'remote_host_runtime'=>$runtimeRemote,'virtual_addr'=>$virtual,
+        'vpn_type'=>'openvpn_client','unit_name'=>$name
+    ));
+    pfz_vpn_json($out);
+}
+
+function pfz_vpn_debug_ipsec_runtime($ikeid) { pfz_vpn_json(pfz_vpn_ipsec_runtime($ikeid)); }
+function pfz_vpn_debug_ipsec_shape() { require_once('ipsec.inc'); pfz_vpn_json(ipsec_list_sa()); }
+function pfz_vpn_debug_openvpn_runtime($vpnid) { $c=pfz_vpn_openvpn_find($vpnid); pfz_vpn_json($c===null?array():$c); }
+
+function pfz_vpn_dispatch($action, $id = '') {
+    switch (strtolower((string)$action)) {
+        case 'version': echo SCRIPT_VERSION; break;
+        case 'discovery_ipsec': pfz_vpn_discovery_ipsec(); break;
+        case 'probe_ipsec': pfz_vpn_probe_ipsec($id); break;
+        case 'debug_ipsec_runtime': pfz_vpn_debug_ipsec_runtime($id); break;
+        case 'debug_ipsec_shape': pfz_vpn_debug_ipsec_shape(); break;
+        case 'discovery_openvpn_client': pfz_vpn_discovery_openvpn_client(); break;
+        case 'probe_openvpn_client': pfz_vpn_probe_openvpn_client($id); break;
+        case 'debug_openvpn_runtime': pfz_vpn_debug_openvpn_runtime($id); break;
+        default: pfz_vpn_json(array('version'=>SCRIPT_VERSION,'error'=>'unknown_vpn_action','action'=>(string)$action));
+    }
+}
+
 //Argument parsers for Discovery
 function pfz_discovery($section){
      switch (strtolower($section)){ 
@@ -2362,6 +2594,19 @@ switch ($mainArgument){
           break;
      case "if_name":
           pfz_get_if_name($argv[2]);
+          break;
+     case "vpnpoc":
+          pfz_vpn_dispatch(isset($argv[2]) ? $argv[2] : '', isset($argv[3]) ? $argv[3] : '');
+          break;
+     case "discovery_ipsec":
+     case "probe_ipsec":
+     case "debug_ipsec_runtime":
+     case "debug_ipsec_shape":
+     case "discovery_openvpn_client":
+     case "probe_openvpn_client":
+     case "debug_openvpn_runtime":
+     case "version":
+          pfz_vpn_dispatch($mainArgument, isset($argv[2]) ? $argv[2] : '');
           break;
      case "traffic_filtered":
           // argv: traffic_filtered <ifname> <total|excluded|clean|debug> [in|out|both]
