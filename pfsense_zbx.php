@@ -8,7 +8,7 @@ This program is licensed under Apache 2.0 License
 */
 
 //Some Useful defines
-define ('SCRIPT_VERSION','0.24.7-baitz.11');
+define ('SCRIPT_VERSION','0.24.7-baitz.12');
 
 define('SPEEDTEST_INTERVAL', 8); //Speedtest Interval (in hours)
 define('CRON_TIME_LIMIT', 300); // Time limit in seconds of speedtest and sysinfo 
@@ -2494,11 +2494,295 @@ function pfz_vpn_debug_ipsec_runtime($ikeid) { pfz_vpn_json(pfz_vpn_ipsec_runtim
 function pfz_vpn_debug_ipsec_shape() { require_once('ipsec.inc'); pfz_vpn_json(ipsec_list_sa()); }
 function pfz_vpn_debug_openvpn_runtime($vpnid) { $c=pfz_vpn_openvpn_find($vpnid); pfz_vpn_json($c===null?array():$c); }
 
-function pfz_vpn_dispatch($action, $id = '') {
+/* Baitz v12 POC - IPsec recovery engine (disabled by default) */
+define('PFZ_VPN_RECOVERY_STATE_FILE', '/tmp/pfz_vpn_recovery_state.json');
+define('PFZ_VPN_RECOVERY_LOCK_FILE', '/tmp/pfz_vpn_recovery.lock');
+define('PFZ_VPN_SWANCTL', '/usr/local/sbin/swanctl');
+
+function pfz_vpn_recovery_bool($value) {
+    return in_array(strtolower(trim((string)$value)), array('1','true','yes','on','enabled'), true);
+}
+
+function pfz_vpn_recovery_parse_config($raw) {
+    $cfg = array(
+        'enabled' => false,
+        'mode' => 'dry-run',
+        'allow' => array(),
+        'min_stuck' => 300,
+        'cooldown' => 3600,
+        'max_attempts' => 1,
+    );
+    $raw = trim((string)$raw);
+    if ($raw === '') return $cfg;
+    // Accept both packed formats used by Zabbix keys/macros: a=1;b=2 and a=1|b=2.
+    foreach (preg_split('/[;|]+/', $raw) as $pair) {
+        $bits = explode('=', $pair, 2);
+        if (count($bits) !== 2) continue;
+        $k = strtolower(trim($bits[0]));
+        $v = trim($bits[1]);
+        switch ($k) {
+            case 'enabled': $cfg['enabled'] = pfz_vpn_recovery_bool($v); break;
+            case 'mode':
+                $m = strtolower($v);
+                $cfg['mode'] = ($m === 'active') ? 'active' : 'dry-run';
+                break;
+            case 'allow':
+                $cfg['allow'] = array_values(array_filter(preg_split('/[;,\s]+/', $v), 'strlen'));
+                break;
+            case 'min':
+            case 'min_stuck':
+                $cfg['min_stuck'] = max(0, min(86400, (int)$v)); break;
+            case 'cool':
+            case 'cooldown':
+                $cfg['cooldown'] = max(0, min(604800, (int)$v)); break;
+            case 'max':
+            case 'max_attempts':
+                $cfg['max_attempts'] = max(1, min(5, (int)$v)); break;
+        }
+    }
+    return $cfg;
+}
+
+function pfz_vpn_recovery_load_state() {
+    if (!file_exists(PFZ_VPN_RECOVERY_STATE_FILE)) return array();
+    $data = json_decode(@file_get_contents(PFZ_VPN_RECOVERY_STATE_FILE), true);
+    return is_array($data) ? $data : array();
+}
+
+function pfz_vpn_recovery_save_state($state) {
+    @file_put_contents(PFZ_VPN_RECOVERY_STATE_FILE, json_encode($state), LOCK_EX);
+}
+
+function pfz_vpn_recovery_child_names($ikeid) {
+    $ikeid = (string)$ikeid;
+    if (!ctype_digit($ikeid)) return array();
+    $base = 'con' . $ikeid;
+    $out = array(); $rc = 0;
+    @exec(PFZ_VPN_SWANCTL . ' --list-conns 2>/dev/null', $out, $rc);
+    $children = array();
+    foreach ($out as $line) {
+        if (preg_match('/^\s+(' . preg_quote($base, '/') . '(?:_\d+)?):(?:\s|$)/', $line, $m)) {
+            $children[$m[1]] = true;
+        }
+    }
+    if (empty($children)) {
+        // Normal IKEv2 commonly uses the same name for IKE and Child SA.
+        $children[$base] = true;
+    }
+    return array_keys($children);
+}
+
+function pfz_vpn_recovery_exec($cmd) {
+    $out = array(); $rc = 0;
+    @exec($cmd . ' 2>&1', $out, $rc);
+    return array(
+        'rc' => (int)$rc,
+        'output' => implode("\n", array_slice($out, -20)),
+    );
+}
+
+function pfz_vpn_recovery_ipsec($ikeid, $config_raw = '') {
+    $now = time();
+    $ikeid = trim((string)$ikeid);
+    $cfg = pfz_vpn_recovery_parse_config($config_raw);
+    $result = array(
+        'version' => SCRIPT_VERSION,
+        'scope' => 'ipsec_recovery',
+        'ikeid' => $ikeid,
+        'enabled' => $cfg['enabled'] ? 1 : 0,
+        'mode' => $cfg['mode'],
+        'eligible' => 0,
+        'executed' => 0,
+        'reason' => '',
+        'decision' => 'observe',
+        'policy' => array(
+            'allow' => $cfg['allow'],
+            'min_stuck' => $cfg['min_stuck'],
+            'cooldown' => $cfg['cooldown'],
+            'max_attempts' => $cfg['max_attempts'],
+        ),
+    );
+
+    if ($ikeid === '' || !ctype_digit($ikeid)) {
+        $result['decision'] = 'blocked';
+        $result['reason'] = 'invalid_ikeid';
+        pfz_vpn_json($result); return;
+    }
+
+    $p1 = pfz_vpn_ipsec_find($ikeid);
+    if (!is_array($p1)) {
+        $result['decision'] = 'blocked';
+        $result['reason'] = 'ikeid_not_found';
+        pfz_vpn_json($result); return;
+    }
+    $disabled = pfz_vpn_pick($p1, array('disabled'), '');
+    if (pfz_vpn_recovery_bool($disabled)) {
+        $result['decision'] = 'blocked';
+        $result['reason'] = 'phase1_disabled';
+        pfz_vpn_json($result); return;
+    }
+
+    $runtime = pfz_vpn_ipsec_runtime($ikeid);
+    $status = strtoupper(trim((string)pfz_vpn_pick($runtime, array('status'), '')));
+    $child_count = (int)pfz_vpn_pick($runtime, array('child_sa_count'), 0);
+    $runtime_found = !empty($runtime['runtime_found']);
+    $healthy = ($runtime_found && $status === 'ESTABLISHED' && $child_count > 0);
+    $result['pre'] = array(
+        'runtime_found' => $runtime_found ? 1 : 0,
+        'status' => $status,
+        'child_sa_count' => $child_count,
+    );
+
+    $lock = @fopen(PFZ_VPN_RECOVERY_LOCK_FILE, 'c');
+    if ($lock === false || !@flock($lock, LOCK_EX)) {
+        $result['decision'] = 'blocked';
+        $result['reason'] = 'lock_failed';
+        if (is_resource($lock)) @fclose($lock);
+        pfz_vpn_json($result); return;
+    }
+
+    $state = pfz_vpn_recovery_load_state();
+    $key = 'ipsec:' . $ikeid;
+    $entry = isset($state[$key]) && is_array($state[$key]) ? $state[$key] : array();
+
+    if ($healthy) {
+        $state[$key] = array(
+            'stuck_since' => 0,
+            'last_attempt' => isset($entry['last_attempt']) ? (int)$entry['last_attempt'] : 0,
+            'attempts' => 0,
+            'last_healthy' => $now,
+            'last_result' => 'healthy',
+        );
+        pfz_vpn_recovery_save_state($state);
+        @flock($lock, LOCK_UN); @fclose($lock);
+        $result['decision'] = 'healthy';
+        $result['reason'] = 'established_with_child_sa';
+        pfz_vpn_json($result); return;
+    }
+
+    $stuck_since = isset($entry['stuck_since']) && (int)$entry['stuck_since'] > 0 ? (int)$entry['stuck_since'] : $now;
+    $last_attempt = isset($entry['last_attempt']) ? (int)$entry['last_attempt'] : 0;
+    $attempts = isset($entry['attempts']) ? (int)$entry['attempts'] : 0;
+    if ($last_attempt > 0 && ($now - $last_attempt) >= $cfg['cooldown']) $attempts = 0;
+
+    $state[$key] = array_merge($entry, array(
+        'stuck_since' => $stuck_since,
+        'attempts' => $attempts,
+        'updated' => $now,
+    ));
+    $stuck_for = max(0, $now - $stuck_since);
+    $result['stuck_for_sec'] = $stuck_for;
+    $result['last_attempt_epoch'] = $last_attempt;
+    $result['attempts_in_window'] = $attempts;
+
+    $allowed = in_array($ikeid, array_map('strval', $cfg['allow']), true);
+    if (!$cfg['enabled']) {
+        $result['decision'] = 'observe'; $result['reason'] = 'recovery_disabled';
+    } elseif (!$allowed) {
+        $result['decision'] = 'blocked'; $result['reason'] = 'ikeid_not_allowlisted';
+    } elseif ($stuck_for < $cfg['min_stuck']) {
+        $result['decision'] = 'wait'; $result['reason'] = 'min_stuck_not_reached';
+    } elseif ($last_attempt > 0 && ($now - $last_attempt) < $cfg['cooldown']) {
+        $result['decision'] = 'cooldown'; $result['reason'] = 'cooldown_active';
+    } elseif ($attempts >= $cfg['max_attempts']) {
+        $result['decision'] = 'blocked'; $result['reason'] = 'max_attempts_reached';
+    } else {
+        $result['eligible'] = 1;
+        $result['decision'] = ($cfg['mode'] === 'active') ? 'recover' : 'dry-run';
+        $result['reason'] = $runtime_found ? 'runtime_without_established_child' : 'runtime_not_found';
+    }
+
+    $con = 'con' . $ikeid;
+    $children = pfz_vpn_recovery_child_names($ikeid);
+    $result['connection'] = $con;
+    $result['children'] = $children;
+    $result['planned_commands'] = array_merge(
+        array(PFZ_VPN_SWANCTL . ' --terminate --ike ' . $con),
+        array_map(function($child) { return PFZ_VPN_SWANCTL . ' --initiate --child ' . $child; }, $children)
+    );
+
+    if ($result['eligible'] && $cfg['mode'] === 'active') {
+        $execution = array();
+        $execution['terminate'] = pfz_vpn_recovery_exec(PFZ_VPN_SWANCTL . ' --terminate --ike ' . escapeshellarg($con));
+        // Small pause allows charon to clear the old IKE/Child SA before re-initiation.
+        sleep(2);
+        $execution['initiate'] = array();
+        foreach ($children as $child) {
+            $execution['initiate'][$child] = pfz_vpn_recovery_exec(PFZ_VPN_SWANCTL . ' --initiate --child ' . escapeshellarg($child));
+        }
+        $attempts++;
+        $state[$key]['last_attempt'] = $now;
+        $state[$key]['attempts'] = $attempts;
+        $state[$key]['last_result'] = 'executed';
+        $result['executed'] = 1;
+        $result['execution'] = $execution;
+    } else {
+        $state[$key]['last_result'] = $result['decision'];
+    }
+
+    pfz_vpn_recovery_save_state($state);
+    @flock($lock, LOCK_UN); @fclose($lock);
+    pfz_vpn_json($result);
+}
+
+function pfz_vpn_dispatch($action, $id = '', $config_raw = '') {
+    // Compatibility with existing pfsense.value[*] wrappers that may forward
+    // only three PHP arguments. Prefer shell-safe compact format:
+    // IKEID~ENABLED~MODE~ALLOW~MIN_STUCK~COOLDOWN~MAX_ATTEMPTS
+    // Example: 12~1~dry-run~12~300~3600~1
+    if (strtolower((string)$action) === 'recovery_ipsec' && trim((string)$config_raw) === '') {
+        $packed = (string)$id;
+
+        // Shell/Zabbix-agent-safe compact format (no special chars):
+        // IKEID_ENABLED_MODE_ALLOW_MINSTUCK_COOLDOWN_MAXATTEMPTS
+        // Example: 12_1_dry-run_12_0_3600_1
+        if (preg_match('/^([0-9]+)_([01])_([A-Za-z0-9-]+)_([0-9,.-]*)_([0-9]+)_([0-9]+)_([0-9]+)$/', $packed, $m)) {
+            $id = $m[1];
+            $config_raw =
+                'enabled=' . $m[2] . ';' .
+                'mode=' . $m[3] . ';' .
+                'allow=' . $m[4] . ';' .
+                'min_stuck=' . $m[5] . ';' .
+                'cooldown=' . $m[6] . ';' .
+                'max_attempts=' . $m[7];
+        }
+        if (strpos($packed, '~') !== false) {
+            $parts = explode('~', $packed);
+            $id = isset($parts[0]) ? $parts[0] : '';
+            $config_raw = 'enabled=' . (isset($parts[1]) ? $parts[1] : '0')
+                . ';mode=' . (isset($parts[2]) ? $parts[2] : 'dry-run')
+                . ';allow=' . (isset($parts[3]) ? $parts[3] : '')
+                . ';min_stuck=' . (isset($parts[4]) ? $parts[4] : '300')
+                . ';cooldown=' . (isset($parts[5]) ? $parts[5] : '3600')
+                . ';max_attempts=' . (isset($parts[6]) ? $parts[6] : '1');
+        } elseif (strpos($packed, '#') !== false) {
+            list($id, $config_raw) = explode('#', $packed, 2);
+        }
+    }
+
     switch (strtolower((string)$action)) {
         case 'version': echo SCRIPT_VERSION; break;
         case 'discovery_ipsec': pfz_vpn_discovery_ipsec(); break;
         case 'probe_ipsec': pfz_vpn_probe_ipsec($id); break;
+        case 'recovery_off':
+            pfz_vpn_recovery_ipsec($id,
+                'enabled=0;mode=dry-run;allow=' . (string)$id .
+                ';min_stuck=300;cooldown=3600;max_attempts=1'
+            );
+            break;
+        case 'recovery_dryrun':
+            pfz_vpn_recovery_ipsec($id,
+                'enabled=1;mode=dry-run;allow=' . (string)$id .
+                ';min_stuck=0;cooldown=3600;max_attempts=1'
+            );
+            break;
+        case 'recovery_active':
+            pfz_vpn_recovery_ipsec($id,
+                'enabled=1;mode=active;allow=' . (string)$id .
+                ';min_stuck=300;cooldown=3600;max_attempts=1'
+            );
+            break;
+        case 'recovery_ipsec': pfz_vpn_recovery_ipsec($id, $config_raw); break;
         case 'debug_ipsec_runtime': pfz_vpn_debug_ipsec_runtime($id); break;
         case 'debug_ipsec_shape': pfz_vpn_debug_ipsec_shape(); break;
         case 'discovery_openvpn_client': pfz_vpn_discovery_openvpn_client(); break;
@@ -2596,17 +2880,18 @@ switch ($mainArgument){
           pfz_get_if_name($argv[2]);
           break;
      case "vpnpoc":
-          pfz_vpn_dispatch(isset($argv[2]) ? $argv[2] : '', isset($argv[3]) ? $argv[3] : '');
+          pfz_vpn_dispatch(isset($argv[2]) ? $argv[2] : '', isset($argv[3]) ? $argv[3] : '', isset($argv[4]) ? $argv[4] : '');
           break;
      case "discovery_ipsec":
      case "probe_ipsec":
+     case "recovery_ipsec":
      case "debug_ipsec_runtime":
      case "debug_ipsec_shape":
      case "discovery_openvpn_client":
      case "probe_openvpn_client":
      case "debug_openvpn_runtime":
      case "version":
-          pfz_vpn_dispatch($mainArgument, isset($argv[2]) ? $argv[2] : '');
+          pfz_vpn_dispatch($mainArgument, isset($argv[2]) ? $argv[2] : '', isset($argv[3]) ? $argv[3] : '');
           break;
      case "traffic_filtered":
           // argv: traffic_filtered <ifname> <total|excluded|clean|debug> [in|out|both]
